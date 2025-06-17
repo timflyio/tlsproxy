@@ -3,14 +3,11 @@
  *	TLS server that autogens certificates.
  *
  * $ go run main.go ca # generate CA
- * $ go run main.go    # run TLS server
+ * $ cat ca.pem >> /etc/ssl/certs/ca-certificates.crt
+ * $ PORT=443 go run main.go    # run TLS server
  *
- * # Add www.evil.com 1.2.3.4 to lo interface
- * $ echo '1.2.3.4 www.evil.com' >> /etc/hosts
- * $ ip addr add 1.2.3.4/32 dev lo
- *
- * # Now the tlsfun server can answer for www.evil.com
- * $ curl -k https://www.evil.com:65443/foo/bar
+ * $ echo '127.0.0.1 api.github.com' >> /etc/hosts
+ * $ curl https://api.github.com/foo/bar
  */
 package main
 
@@ -33,13 +30,15 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/golang-lru/v2"
 )
 
 const DefaultTarg = "140.82.116.6:443"
-const DefaultPort = "65443"
+const DefaultPort = "443"
+const DefaultToken = "TOKENTOKENTOKEN"
 const DefaultDialTimeout = 30 * time.Second
 const CertOrgName = "Fly.io TLS Proxy"
 const GraceTime = 5 * time.Minute
@@ -191,9 +190,10 @@ type Server struct {
 	certCache *lru.Cache[string, *tls.Certificate]
 	cl        *http.Client
 	url       string
+	token     string
 }
 
-func newServer(url, targ string) (*Server, error) {
+func newServer(url, targ, token string) (*Server, error) {
 	cache, err := lru.New[string, *tls.Certificate](1024)
 	if err != nil {
 		return nil, err
@@ -215,6 +215,7 @@ func newServer(url, targ string) (*Server, error) {
 		certCache: cache,
 		cl:        cl,
 		url:       url,
+		token:     token,
 	}
 	return s, nil
 }
@@ -252,6 +253,14 @@ func copyHeaders(targ, src http.Header) {
 	}
 }
 
+func replaceHeaderVal(hdr http.Header, from, to string) {
+	for k, vs := range hdr {
+		for n, v := range vs {
+			hdr[k][n] = strings.ReplaceAll(v, from, to)
+		}
+	}
+}
+
 func (p *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	url := fmt.Sprintf("%s%s", p.url, req.URL)
 	log.Printf("serve %s %s", req.Method, url)
@@ -268,11 +277,8 @@ func (p *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	for k, vs := range req.Header {
-		log.Printf("header %v = %v", k, vs)
-	}
-
 	copyHeaders(preq.Header, req.Header)
+	replaceHeaderVal(preq.Header, "TOKEN", p.token)
 	presp, err := p.cl.Do(preq)
 	if err != nil {
 		// TODO: better error translation, StatusBadGateway/StatusServiceUnavailable/StatusGatewayTimeout
@@ -288,15 +294,17 @@ func (p *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+func getenv(varName, defval string) string {
+	if s := os.Getenv(varName); s != "" {
+		return s
+	}
+	return defval
+}
+
 func main() {
-	targ := DefaultTarg
-	if s := os.Getenv("TARG"); s != "" {
-		targ = s
-	}
-	port := DefaultPort
-	if s := os.Getenv("PORT"); s != "" {
-		port = s
-	}
+	targ := getenv("TARG", DefaultTarg)
+	port := getenv("PORT", DefaultPort)
+	token := getenv("TOKEN", DefaultToken)
 
 	if len(os.Args) > 1 && os.Args[1] == "ca" {
 		fmt.Printf("making CA\n")
@@ -328,7 +336,7 @@ func main() {
 	}
 
 	fmt.Printf("running server\n")
-	serv, err := newServer("https://api.github.com", targ)
+	serv, err := newServer("https://api.github.com", targ, token)
 	if err != nil {
 		fmt.Printf("newServer: %v\n", err)
 		return

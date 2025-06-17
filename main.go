@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	//"crypto/ed25519"
@@ -26,8 +27,10 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"time"
@@ -35,7 +38,9 @@ import (
 	"github.com/hashicorp/golang-lru/v2"
 )
 
+const DefaultTarg = "140.82.116.6:443"
 const DefaultPort = "65443"
+const DefaultDialTimeout = 30 * time.Second
 const CertOrgName = "Fly.io TLS Proxy"
 const GraceTime = 5 * time.Minute
 const CertLife = time.Hour
@@ -184,15 +189,33 @@ func loadCA() error {
 
 type Server struct {
 	certCache *lru.Cache[string, *tls.Certificate]
+	cl        *http.Client
+	url       string
 }
 
-func newServer() (*Server, error) {
+func newServer(url, targ string) (*Server, error) {
 	cache, err := lru.New[string, *tls.Certificate](1024)
 	if err != nil {
 		return nil, err
 	}
 
-	s := &Server{cache}
+	// always dials targ, ignoring DNS and /etc/hosts.
+	cl := &http.Client{}
+	cl.Transport = &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			conn, err := net.DialTimeout("tcp", targ, DefaultDialTimeout)
+			if err != nil {
+				return nil, fmt.Errorf("could not dial %s: %w", targ, err)
+			}
+			return conn, nil
+		},
+	}
+
+	s := &Server{
+		certCache: cache,
+		cl:        cl,
+		url:       url,
+	}
 	return s, nil
 }
 
@@ -223,7 +246,53 @@ func (p *Server) getCertificate(sni *tls.ClientHelloInfo) (*tls.Certificate, err
 	return cert, nil
 }
 
+func copyHeaders(targ, src http.Header) {
+	for k, vs := range src {
+		targ[k] = vs
+	}
+}
+
+func (p *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	url := fmt.Sprintf("%s%s", p.url, req.URL)
+	log.Printf("serve %s %s", req.Method, url)
+	errResp := func(status int, err error) {
+		w.WriteHeader(status)
+		log.Printf("%v", err)
+		fmt.Fprintf(w, "%v\n", err)
+	}
+
+	ctx := req.Context()
+	preq, err := http.NewRequestWithContext(ctx, req.Method, url, req.Body)
+	if err != nil {
+		errResp(http.StatusInternalServerError, fmt.Errorf("NewRequestWithContext: %w", err))
+		return
+	}
+
+	for k, vs := range req.Header {
+		log.Printf("header %v = %v", k, vs)
+	}
+
+	copyHeaders(preq.Header, req.Header)
+	presp, err := p.cl.Do(preq)
+	if err != nil {
+		// TODO: better error translation, StatusBadGateway/StatusServiceUnavailable/StatusGatewayTimeout
+		errResp(http.StatusGatewayTimeout, err)
+		return
+	}
+
+	log.Printf("serve %s %s -> %d %q", req.Method, url, presp.StatusCode, presp.Status)
+	copyHeaders(w.Header(), presp.Header)
+	w.WriteHeader(presp.StatusCode)
+	if _, err := io.Copy(w, presp.Body); err != nil {
+		log.Printf("copying response: %v", err)
+	}
+}
+
 func main() {
+	targ := DefaultTarg
+	if s := os.Getenv("TARG"); s != "" {
+		targ = s
+	}
 	port := DefaultPort
 	if s := os.Getenv("PORT"); s != "" {
 		port = s
@@ -259,21 +328,15 @@ func main() {
 	}
 
 	fmt.Printf("running server\n")
-	serv, err := newServer()
+	serv, err := newServer("https://api.github.com", targ)
 	if err != nil {
 		fmt.Printf("newServer: %v\n", err)
 		return
 	}
 
-	// TODO: replace with proxy handler.
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(res http.ResponseWriter, req *http.Request) {
-		fmt.Fprintf(res, "Running HTTPS Server!! You are %s\n", req.RemoteAddr)
-	})
-
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%s", port),
-		Handler: mux,
+		Handler: serv,
 		TLSConfig: &tls.Config{
 			GetCertificate: serv.getCertificate,
 		},

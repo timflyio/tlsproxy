@@ -9,11 +9,10 @@
  * $ echo '1.2.3.4 www.evil.com' >> /etc/hosts
  * $ ip addr add 1.2.3.4/32 dev lo
  *
- * # Now the tlsfun server can answer for www.evil.com 
+ * # Now the tlsfun server can answer for www.evil.com
  * $ curl -k https://www.evil.com:65443/foo/bar
  */
 package main
-
 
 import (
 	"crypto"
@@ -166,7 +165,7 @@ func newTlsCert(host string, isCA bool) (*tls.Certificate, error) {
 }
 
 func makeCA() error {
-	cert, err := newTlsCert(CertOrgName + " CA", true)
+	cert, err := newTlsCert(CertOrgName+" CA", true)
 	if err != nil {
 		return err
 	}

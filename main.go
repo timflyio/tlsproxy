@@ -8,6 +8,10 @@
  *
  * $ echo '127.0.0.1 api.github.com' >> /etc/hosts
  * $ curl https://api.github.com/foo/bar
+ *
+ * $ TOKEN=<a github token here> PORT=443 go run main.go
+ * $ export GH_TOKEN=TOKEN
+ * $ gh auth status
  */
 package main
 

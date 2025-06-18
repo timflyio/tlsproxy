@@ -16,7 +16,6 @@
 package main
 
 import (
-	"context"
 	"crypto"
 	"crypto/ecdsa"
 	//"crypto/ed25519"
@@ -31,19 +30,20 @@ import (
 	"io"
 	"log"
 	"math/big"
-	"net"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/hashicorp/golang-lru/v2"
+
+	"github.com/superfly/tokenizer"
 )
 
-const DefaultTarg = "140.82.116.6:443"
+const DefaultUrl = "https://api.github.com"
+const DefaultProxy = "https://tokenizer.fly.io"
+const DefaultProxyAuth = "proxyauthtoken"
 const DefaultPort = "443"
-const DefaultToken = "TOKENTOKENTOKEN"
-const DefaultDialTimeout = 30 * time.Second
 const CertOrgName = "Fly.io TLS Proxy"
 const GraceTime = 5 * time.Minute
 const CertLife = time.Hour
@@ -192,34 +192,22 @@ func loadCA() error {
 
 type Server struct {
 	certCache *lru.Cache[string, *tls.Certificate]
-	cl        *http.Client
 	url       string
-	token     string
+	proxy     string
+	proxyAuth string
 }
 
-func newServer(url, targ, token string) (*Server, error) {
+func newServer(url, proxy, proxyAuth string) (*Server, error) {
 	cache, err := lru.New[string, *tls.Certificate](1024)
 	if err != nil {
 		return nil, err
 	}
 
-	// always dials targ, ignoring DNS and /etc/hosts.
-	cl := &http.Client{}
-	cl.Transport = &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			conn, err := net.DialTimeout("tcp", targ, DefaultDialTimeout)
-			if err != nil {
-				return nil, fmt.Errorf("could not dial %s: %w", targ, err)
-			}
-			return conn, nil
-		},
-	}
-
 	s := &Server{
 		certCache: cache,
-		cl:        cl,
 		url:       url,
-		token:     token,
+		proxy:     proxy,
+		proxyAuth: proxyAuth,
 	}
 	return s, nil
 }
@@ -238,11 +226,11 @@ func (p *Server) getCachedCert(name string) *tls.Certificate {
 
 func (p *Server) getCertificate(sni *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	if cert := p.getCachedCert(sni.ServerName); cert != nil {
-		fmt.Printf("reusing cert for %s\n", sni.ServerName)
+		log.Printf("reusing cert for %s\n", sni.ServerName)
 		return cert, nil
 	}
 
-	fmt.Printf("generate cert for %s\n", sni.ServerName)
+	log.Printf("generate cert for %s\n", sni.ServerName)
 	cert, err := newTlsCert(sni.ServerName, false)
 	if err != nil {
 		return nil, err
@@ -257,11 +245,20 @@ func copyHeaders(targ, src http.Header) {
 	}
 }
 
-func replaceHeaderVal(hdr http.Header, from, to string) {
-	for k, vs := range hdr {
-		for n, v := range vs {
-			hdr[k][n] = strings.ReplaceAll(v, from, to)
-		}
+func getAuth(hdr string) string {
+	if hdr == "" {
+		return ""
+	}
+
+	// take just the last word, ie "Authorization: Bearer foobar" -> "foobar".
+	ws := strings.Split(hdr, " ")
+	return ws[len(ws)-1]
+}
+
+func printHeaders(s string, hdr http.Header) {
+	log.Printf("%s:", s)
+	for k, v := range hdr {
+		log.Printf("  %s=%v", k, v)
 	}
 }
 
@@ -274,6 +271,25 @@ func (p *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		fmt.Fprintf(w, "%v\n", err)
 	}
 
+	// Take authorization header and use as the sealed secret.
+	auth := getAuth(req.Header.Get("Authorization"))
+	if auth == "" {
+		errResp(http.StatusUnauthorized, fmt.Errorf("missing auth header"))
+		return
+	}
+	req.Header.Del("Authorization")
+
+	// Get a client that proxies to the tokenizer with the sealed secret.
+	cl, err := tokenizer.Client(
+		p.proxy,
+		tokenizer.WithAuth(p.proxyAuth),
+		tokenizer.WithSecret(auth, nil),
+	)
+	if err != nil {
+		errResp(http.StatusInternalServerError, fmt.Errorf("tokenizer.Client: %w", err))
+		return
+	}
+
 	ctx := req.Context()
 	preq, err := http.NewRequestWithContext(ctx, req.Method, url, req.Body)
 	if err != nil {
@@ -282,8 +298,7 @@ func (p *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	copyHeaders(preq.Header, req.Header)
-	replaceHeaderVal(preq.Header, "TOKEN", p.token)
-	presp, err := p.cl.Do(preq)
+	presp, err := cl.Do(preq)
 	if err != nil {
 		// TODO: better error translation, StatusBadGateway/StatusServiceUnavailable/StatusGatewayTimeout
 		errResp(http.StatusGatewayTimeout, err)
@@ -306,43 +321,44 @@ func getenv(varName, defval string) string {
 }
 
 func main() {
-	targ := getenv("TARG", DefaultTarg)
+	url := getenv("URL", DefaultUrl)
+	proxy := getenv("PROXY", DefaultProxy)
+	proxyAuth := getenv("PROXYAUTH", DefaultProxyAuth)
 	port := getenv("PORT", DefaultPort)
-	token := getenv("TOKEN", DefaultToken)
 
 	if len(os.Args) > 1 && os.Args[1] == "ca" {
-		fmt.Printf("making CA\n")
+		log.Printf("making CA\n")
 		if err := makeCA(); err != nil {
-			fmt.Printf("makeCA: %v\n", err)
+			log.Printf("makeCA: %v\n", err)
 		} else {
-			fmt.Printf("write CA files\n")
+			log.Printf("write CA files\n")
 		}
 		return
 	}
 
 	if err := loadCA(); err != nil {
-		fmt.Printf("loadCA: %v\n", err)
+		log.Printf("loadCA: %v\n", err)
 		return
 	}
 
 	if len(os.Args) > 1 && os.Args[1] == "test" {
-		fmt.Printf("running test\n")
+		log.Printf("running test\n")
 		cert, err := newTlsCert("www.thenewsh.com", false)
 		if err != nil {
-			fmt.Printf("newTlsCert: %v\n", err)
+			log.Printf("newTlsCert: %v\n", err)
 			return
 		}
 		if err := WriteX509KeyPair(cert, "host.pem", "host-key.pem"); err != nil {
-			fmt.Printf("%v\n", err)
+			log.Printf("%v\n", err)
 			return
 		}
 		return
 	}
 
-	fmt.Printf("running server\n")
-	serv, err := newServer("https://api.github.com", targ, token)
+	log.Printf("running server\n")
+	serv, err := newServer(url, proxy, proxyAuth)
 	if err != nil {
-		fmt.Printf("newServer: %v\n", err)
+		log.Printf("newServer: %v\n", err)
 		return
 	}
 

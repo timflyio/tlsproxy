@@ -32,7 +32,6 @@ import (
 	"math/big"
 	"net/http"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/hashicorp/golang-lru/v2"
@@ -192,22 +191,28 @@ func loadCA() error {
 
 type Server struct {
 	certCache *lru.Cache[string, *tls.Certificate]
+	cl        *http.Client
 	url       string
-	proxy     string
-	proxyAuth string
 }
 
-func newServer(url, proxy, proxyAuth string) (*Server, error) {
+func newServer(url, urlAuth, proxy, proxyAuth string) (*Server, error) {
 	cache, err := lru.New[string, *tls.Certificate](1024)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("lru.New: %w", err)
+	}
+
+	cl, err := tokenizer.Client(proxy,
+		tokenizer.WithAuth(proxyAuth),
+		tokenizer.WithSecret(urlAuth, nil),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("tokenizer.Client: %w", err)
 	}
 
 	s := &Server{
 		certCache: cache,
+		cl:        cl,
 		url:       url,
-		proxy:     proxy,
-		proxyAuth: proxyAuth,
 	}
 	return s, nil
 }
@@ -245,16 +250,6 @@ func copyHeaders(targ, src http.Header) {
 	}
 }
 
-func getAuth(hdr string) string {
-	if hdr == "" {
-		return ""
-	}
-
-	// take just the last word, ie "Authorization: Bearer foobar" -> "foobar".
-	ws := strings.Split(hdr, " ")
-	return ws[len(ws)-1]
-}
-
 func printHeaders(s string, hdr http.Header) {
 	log.Printf("%s:", s)
 	for k, v := range hdr {
@@ -271,25 +266,6 @@ func (p *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		fmt.Fprintf(w, "%v\n", err)
 	}
 
-	// Take authorization header and use as the sealed secret.
-	auth := getAuth(req.Header.Get("Authorization"))
-	if auth == "" {
-		errResp(http.StatusUnauthorized, fmt.Errorf("missing auth header"))
-		return
-	}
-	req.Header.Del("Authorization")
-
-	// Get a client that proxies to the tokenizer with the sealed secret.
-	cl, err := tokenizer.Client(
-		p.proxy,
-		tokenizer.WithAuth(p.proxyAuth),
-		tokenizer.WithSecret(auth, nil),
-	)
-	if err != nil {
-		errResp(http.StatusInternalServerError, fmt.Errorf("tokenizer.Client: %w", err))
-		return
-	}
-
 	ctx := req.Context()
 	preq, err := http.NewRequestWithContext(ctx, req.Method, url, req.Body)
 	if err != nil {
@@ -298,7 +274,8 @@ func (p *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	copyHeaders(preq.Header, req.Header)
-	presp, err := cl.Do(preq)
+	preq.Header.Del("Authorization")
+	presp, err := p.cl.Do(preq)
 	if err != nil {
 		// TODO: better error translation, StatusBadGateway/StatusServiceUnavailable/StatusGatewayTimeout
 		errResp(http.StatusGatewayTimeout, err)
@@ -322,6 +299,7 @@ func getenv(varName, defval string) string {
 
 func main() {
 	url := getenv("URL", DefaultUrl)
+	urlAuth := getenv("URLAUTH", "")
 	proxy := getenv("PROXY", DefaultProxy)
 	proxyAuth := getenv("PROXYAUTH", DefaultProxyAuth)
 	port := getenv("PORT", DefaultPort)
@@ -355,8 +333,13 @@ func main() {
 		return
 	}
 
+	if urlAuth == "" {
+		log.Printf("URLAUTH is not set")
+		return
+	}
+
 	log.Printf("running server\n")
-	serv, err := newServer(url, proxy, proxyAuth)
+	serv, err := newServer(url, urlAuth, proxy, proxyAuth)
 	if err != nil {
 		log.Printf("newServer: %v\n", err)
 		return

@@ -8,3 +8,7 @@ This allows intercepting requests by setting DNS or `/etc/hosts` to direct a hos
 `echo "::1 api.github.com" >> /etc/hosts`.
 
 See [tokenizer docs](https://github.com/superfly/tokenizer) for details on sealing keys.
+
+See [proxy pilot](https://github.com/timflyio/proxypilot) for an example that uses tlsproxy as a sidecar
+so that the shell container does not have access to the real github token but can still use the `gh` client
+to make github API requests.

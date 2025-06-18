@@ -347,7 +347,7 @@ func main() {
 	}
 
 	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%s", port),
+		Addr:    fmt.Sprintf("[::1]:%s", port),
 		Handler: serv,
 		TLSConfig: &tls.Config{
 			GetCertificate: serv.getCertificate,

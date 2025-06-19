@@ -8,10 +8,6 @@
  *
  * $ echo '127.0.0.1 api.github.com' >> /etc/hosts
  * $ curl https://api.github.com/foo/bar
- *
- * $ TOKEN=<a github token here> PORT=443 go run main.go
- * $ export GH_TOKEN=TOKEN
- * $ gh auth status
  */
 package main
 
@@ -40,8 +36,7 @@ import (
 )
 
 const DefaultUrl = "https://api.github.com"
-const DefaultProxy = "https://tokenizer.fly.io"
-const DefaultProxyAuth = "proxyauthtoken"
+const DefaultProxy = "http://tokenizer.flycast"
 const DefaultPort = "443"
 const CertOrgName = "Fly.io TLS Proxy"
 const GraceTime = 5 * time.Minute
@@ -195,16 +190,13 @@ type Server struct {
 	url       string
 }
 
-func newServer(url, urlAuth, proxy, proxyAuth string) (*Server, error) {
+func newServer(url, urlAuth, proxy string) (*Server, error) {
 	cache, err := lru.New[string, *tls.Certificate](1024)
 	if err != nil {
 		return nil, fmt.Errorf("lru.New: %w", err)
 	}
 
-	cl, err := tokenizer.Client(proxy,
-		tokenizer.WithAuth(proxyAuth),
-		tokenizer.WithSecret(urlAuth, nil),
-	)
+	cl, err := tokenizer.Client(proxy, tokenizer.WithSecret(urlAuth, nil))
 	if err != nil {
 		return nil, fmt.Errorf("tokenizer.Client: %w", err)
 	}
@@ -301,7 +293,6 @@ func main() {
 	url := getenv("URL", DefaultUrl)
 	urlAuth := getenv("URLAUTH", "")
 	proxy := getenv("PROXY", DefaultProxy)
-	proxyAuth := getenv("PROXYAUTH", DefaultProxyAuth)
 	port := getenv("PORT", DefaultPort)
 
 	if len(os.Args) > 1 && os.Args[1] == "ca" {
@@ -339,7 +330,7 @@ func main() {
 	}
 
 	log.Printf("running server\n")
-	serv, err := newServer(url, urlAuth, proxy, proxyAuth)
+	serv, err := newServer(url, urlAuth, proxy)
 	if err != nil {
 		log.Printf("newServer: %v\n", err)
 		return

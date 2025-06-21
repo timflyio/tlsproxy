@@ -13,3 +13,9 @@ See [tokenizer docs](https://github.com/superfly/tokenizer) for details on seali
 See [proxy pilot](https://github.com/timflyio/proxypilot) for an example that uses tlsproxy as a sidecar
 so that the shell container does not have access to the real github token but can still use the `gh` client
 to make github API requests.
+
+## Notes
+
+Tlsproxy proxies through another proxy to a single target, but it could easily be made to proxy
+to several targets based on the SNI and Host header field, with a different sealed secret for each
+target.

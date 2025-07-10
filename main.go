@@ -22,12 +22,14 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math/big"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/golang-lru/v2"
@@ -35,10 +37,9 @@ import (
 	"github.com/superfly/tokenizer"
 )
 
-const DefaultUrl = "https://api.github.com"
 const DefaultProxy = "http://tokenizer.flycast"
 const DefaultPort = "443"
-const CertOrgName = "Fly.io TLS Proxy"
+const CertOrgName = "Fly.io TLS Tokenizing Proxy"
 const GraceTime = 5 * time.Minute
 const CertLife = time.Hour
 const CALife = 90 * 24 * time.Hour
@@ -184,27 +185,43 @@ func loadCA() error {
 	return nil
 }
 
-type Server struct {
-	certCache *lru.Cache[string, *tls.Certificate]
-	cl        *http.Client
-	url       string
+type Target struct {
+	Host string
+	Auth string
+	Url  string
+
+	cl *http.Client
 }
 
-func newServer(url, urlAuth, proxy string) (*Server, error) {
+type Server struct {
+	certCache *lru.Cache[string, *tls.Certificate]
+	target    map[string]*Target
+}
+
+func newServer(proxy string, targets ...*Target) (*Server, error) {
 	cache, err := lru.New[string, *tls.Certificate](1024)
 	if err != nil {
 		return nil, fmt.Errorf("lru.New: %w", err)
 	}
 
-	cl, err := tokenizer.Client(proxy, tokenizer.WithSecret(urlAuth, nil))
-	if err != nil {
-		return nil, fmt.Errorf("tokenizer.Client: %w", err)
+	var errs error
+	targs := make(map[string]*Target)
+	for _, target := range targets {
+		cl, err := tokenizer.Client(proxy, tokenizer.WithSecret(target.Auth, nil))
+		if err != nil {
+			errs = errors.Join(err, fmt.Errorf("tokenizer.Client for %s: %w", target.Host, err))
+		} else {
+			target.cl = cl
+		}
+		targs[target.Host] = target
+	}
+	if errs != nil {
+		return nil, errs
 	}
 
 	s := &Server{
 		certCache: cache,
-		cl:        cl,
-		url:       url,
+		target:    targs,
 	}
 	return s, nil
 }
@@ -222,6 +239,11 @@ func (p *Server) getCachedCert(name string) *tls.Certificate {
 }
 
 func (p *Server) getCertificate(sni *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	if _, ok := p.target[sni.ServerName]; !ok {
+		log.Printf("refusing to serve certificate for %q", sni.ServerName)
+		return nil, fmt.Errorf("refusing to serve certificate for %q", sni.ServerName)
+	}
+
 	if cert := p.getCachedCert(sni.ServerName); cert != nil {
 		log.Printf("reusing cert for %s\n", sni.ServerName)
 		return cert, nil
@@ -250,11 +272,21 @@ func printHeaders(s string, hdr http.Header) {
 }
 
 func (p *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	url := fmt.Sprintf("%s%s", p.url, req.URL)
-	log.Printf("serve %s %s", req.Method, url)
+	if req.TLS == nil {
+		log.Printf("%s %s: refusing to serve request with nil TLS!", req.Method, req.URL)
+		return
+	}
+	target, ok := p.target[req.TLS.ServerName]
+	if !ok {
+		log.Printf("%s %s: refusing to serve request for %q", req.Method, req.URL, req.TLS.ServerName)
+		return
+	}
+
+	url := fmt.Sprintf("%s%s", target.Url, req.URL)
+	log.Printf("%s %s serve", req.Method, url)
 	errResp := func(status int, err error) {
 		w.WriteHeader(status)
-		log.Printf("%v", err)
+		log.Printf("%s %s %v", req.Method, url, err)
 		fmt.Fprintf(w, "%v\n", err)
 	}
 
@@ -266,19 +298,18 @@ func (p *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	copyHeaders(preq.Header, req.Header)
-	preq.Header.Del("Authorization")
-	presp, err := p.cl.Do(preq)
+	presp, err := target.cl.Do(preq)
 	if err != nil {
 		// TODO: better error translation, StatusBadGateway/StatusServiceUnavailable/StatusGatewayTimeout
 		errResp(http.StatusGatewayTimeout, err)
 		return
 	}
 
-	log.Printf("serve %s %s -> %d %q", req.Method, url, presp.StatusCode, presp.Status)
+	log.Printf("%s %s serve -> %d %q", req.Method, url, presp.StatusCode, presp.Status)
 	copyHeaders(w.Header(), presp.Header)
 	w.WriteHeader(presp.StatusCode)
 	if _, err := io.Copy(w, presp.Body); err != nil {
-		log.Printf("copying response: %v", err)
+		log.Printf("%s %s copying response: %v", req.Method, url, err)
 	}
 }
 
@@ -289,12 +320,36 @@ func getenv(varName, defval string) string {
 	return defval
 }
 
-func main() {
-	url := getenv("URL", DefaultUrl)
-	urlAuth := getenv("URLAUTH", "")
-	proxy := getenv("PROXY", DefaultProxy)
-	port := getenv("PORT", DefaultPort)
+func parseTargets(targSpecs string) ([]*Target, error) {
+	if targSpecs == "" {
+		return nil, fmt.Errorf("no targets specified")
+	}
 
+	var targets []*Target
+	for _, targSpec := range strings.Split(targSpecs, ",") {
+		ws := strings.SplitN(targSpec, "=", 2)
+		if len(ws) != 2 {
+			return nil, fmt.Errorf("%q is malformed, must be HostName=EnvName")
+		}
+
+		hostName := ws[0]
+		envName := ws[1]
+		auth := os.Getenv(envName)
+		if auth == "" {
+			return nil, fmt.Errorf("auth %q is not set", envName)
+		}
+
+		targets = append(targets, &Target{
+			Host: hostName,
+			Auth: auth,
+			Url:  "https://" + hostName,
+		})
+	}
+
+	return targets, nil
+}
+
+func main() {
 	if len(os.Args) > 1 && os.Args[1] == "ca" {
 		log.Printf("making CA\n")
 		if err := makeCA(); err != nil {
@@ -305,32 +360,27 @@ func main() {
 		return
 	}
 
+	if len(os.Args) > 1 {
+		log.Printf("bad usage")
+		os.Exit(1)
+	}
+
+	proxy := getenv("PROXY", DefaultProxy)
+	port := getenv("PORT", DefaultPort)
+
+	targets, err := parseTargets(os.Getenv("TARGETS"))
+	if err != nil {
+		log.Printf("TARGETS is not set properly: %v", err)
+		os.Exit(1)
+	}
+
 	if err := loadCA(); err != nil {
 		log.Printf("loadCA: %v\n", err)
 		return
 	}
 
-	if len(os.Args) > 1 && os.Args[1] == "test" {
-		log.Printf("running test\n")
-		cert, err := newTlsCert("www.thenewsh.com", false)
-		if err != nil {
-			log.Printf("newTlsCert: %v\n", err)
-			return
-		}
-		if err := WriteX509KeyPair(cert, "host.pem", "host-key.pem"); err != nil {
-			log.Printf("%v\n", err)
-			return
-		}
-		return
-	}
-
-	if urlAuth == "" {
-		log.Printf("URLAUTH is not set")
-		return
-	}
-
 	log.Printf("running server\n")
-	serv, err := newServer(url, urlAuth, proxy)
+	serv, err := newServer(proxy, targets...)
 	if err != nil {
 		log.Printf("newServer: %v\n", err)
 		return

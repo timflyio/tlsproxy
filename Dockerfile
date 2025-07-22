@@ -1,4 +1,4 @@
-# docker build -t timflyio/tlsproxy .
+# docker build --platform linux/amd64 -t timflyio/tlsproxy .
 # docker push timflyio/tlsproxy
 # ----
 ARG GO_VERSION=1

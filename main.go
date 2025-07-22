@@ -2,12 +2,28 @@
  * main.go
  *	TLS server that autogens certificates.
  *
- * $ go run main.go ca # generate CA
- * $ cat ca.pem >> /etc/ssl/certs/ca-certificates.crt
- * $ PORT=443 go run main.go    # run TLS server
+ * Generates CA in $CWD if it does not exist.
+ * CA cert can be fetched via https://localhost/ca-cert.pem.
  *
- * $ echo '127.0.0.1 api.github.com' >> /etc/hosts
- * $ curl https://api.github.com/foo/bar
+ * # configure and run the server
+ * $ export TARGETS="api.anthropic.com=ANTHROPIC_API_KEY,api.openai.com=OPENAI_API_KEY,api.github.com=GH_TOKEN"
+ * $ export ANTHROPIC_API_KEY="$(./seal -org $ORG -app $APP -host api.anthropic.com -header x-api-key $ANTHROPIC_API_KEY)"
+ * $ export OPENAI_API_KEY="$(./seal -org $ORG -app $APP -host api.openai.com $OPENAI_API_KEY)"
+ * $ export GH_TOKEN="$(./seal -org $ORG -app $APP -host api.github.com $GH_TOKEN)"
+ * $ go run main.go
+ *
+ * # get the cert
+ * $ curl -s -k https://localhost/ca-cert.pem > ca.pem
+ * # install the cert
+ * $ cat ca.pem >> /etc/ssl/certs/ca-certificates.crt
+ * # redirect api.openai.com to the proxy
+ * $ echo '127.0.0.1 api.openai.com' >> /etc/hosts
+ * # fetch from api.openai.com via the proxy
+ * $ export OPENAI_API_KEY=dummy
+ * $ curl https://api.openai.com/v1/responses \
+ *   -H "Content-Type: application/json" \
+ *   -H "Authorization: Bearer $OPENAI_API_KEY" \
+ *   -d '{"model": "gpt-4o-mini", "input": "Write a one-sentence bedtime story about a unicorn."}'
  */
 package main
 
@@ -43,8 +59,8 @@ const CertOrgName = "Fly.io TLS Tokenizing Proxy"
 const GraceTime = 5 * time.Minute
 const CertLife = time.Hour
 const CALife = 90 * 24 * time.Hour
-
-var CA *tls.Certificate
+const CA_FILE = "ca.pem"
+const CA_KEY_FILE = "ca-key.pem"
 
 func WriteX509KeyPair(cert *tls.Certificate, certFile, keyFile string) error {
 	if err := writeCertPem(cert, certFile); err != nil {
@@ -91,7 +107,9 @@ func writeKeyPem(cert *tls.Certificate, fn string) error {
 	return nil
 }
 
-func newTlsCert(host string, isCA bool) (*tls.Certificate, error) {
+func newTlsCert(host string, CA *tls.Certificate) (*tls.Certificate, error) {
+	isCA := (CA == nil)
+
 	//_, priv, err := ed25519.GenerateKey(rand.Reader)
 	//priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -167,22 +185,33 @@ func newTlsCert(host string, isCA bool) (*tls.Certificate, error) {
 	return tlsCert, nil
 }
 
-func makeCA() error {
-	cert, err := newTlsCert(CertOrgName+" CA", true)
+func makeCA() (*tls.Certificate, error) {
+	cert, err := newTlsCert(CertOrgName+" CA", nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return WriteX509KeyPair(cert, "ca.pem", "ca-key.pem")
+	if err := WriteX509KeyPair(cert, CA_FILE, CA_KEY_FILE); err != nil {
+		return nil, err
+	}
+	return cert, nil
 }
 
-func loadCA() error {
-	ca, err := tls.LoadX509KeyPair("ca.pem", "ca-key.pem")
+func loadCA() (*tls.Certificate, error) {
+	ca, err := tls.LoadX509KeyPair(CA_FILE, CA_KEY_FILE)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	CA = &ca
-	return nil
+	return &ca, nil
+}
+
+func loadOrMakeCA() (*tls.Certificate, error) {
+	ca, err := loadCA()
+	if errors.Is(err, os.ErrNotExist) {
+		log.Printf("generating a CA...")
+		ca, err = makeCA()
+	}
+	return ca, err
 }
 
 type Target struct {
@@ -194,11 +223,12 @@ type Target struct {
 }
 
 type Server struct {
+	ca        *tls.Certificate
 	certCache *lru.Cache[string, *tls.Certificate]
 	target    map[string]*Target
 }
 
-func newServer(proxy string, targets ...*Target) (*Server, error) {
+func newServer(ca *tls.Certificate, proxy string, targets ...*Target) (*Server, error) {
 	cache, err := lru.New[string, *tls.Certificate](1024)
 	if err != nil {
 		return nil, fmt.Errorf("lru.New: %w", err)
@@ -220,6 +250,7 @@ func newServer(proxy string, targets ...*Target) (*Server, error) {
 	}
 
 	s := &Server{
+		ca:        ca,
 		certCache: cache,
 		target:    targs,
 	}
@@ -238,8 +269,8 @@ func (p *Server) getCachedCert(name string) *tls.Certificate {
 	return nil
 }
 
-func (p *Server) getCertificate(sni *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	if _, ok := p.target[sni.ServerName]; !ok {
+func (p *Server) getCertificateBySNI(sni *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	if _, ok := p.target[sni.ServerName]; !ok && sni.ServerName != "localhost" {
 		log.Printf("refusing to serve certificate for %q", sni.ServerName)
 		return nil, fmt.Errorf("refusing to serve certificate for %q", sni.ServerName)
 	}
@@ -250,7 +281,7 @@ func (p *Server) getCertificate(sni *tls.ClientHelloInfo) (*tls.Certificate, err
 	}
 
 	log.Printf("generate cert for %s\n", sni.ServerName)
-	cert, err := newTlsCert(sni.ServerName, false)
+	cert, err := newTlsCert(sni.ServerName, p.ca)
 	if err != nil {
 		return nil, err
 	}
@@ -271,11 +302,28 @@ func printHeaders(s string, hdr http.Header) {
 	}
 }
 
+func (p *Server) localhostServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.URL.Path != "/ca-cert.pem" {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprintf(w, "not found\n")
+		return
+	}
+
+	bs := p.ca.Certificate[0]
+	pem.Encode(w, &pem.Block{Type: "CERTIFICATE", Bytes: bs})
+}
+
 func (p *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.TLS == nil {
 		log.Printf("%s %s: refusing to serve request with nil TLS!", req.Method, req.URL)
 		return
 	}
+
+	if req.TLS.ServerName == "localhost" {
+		p.localhostServeHTTP(w, req)
+		return
+	}
+
 	target, ok := p.target[req.TLS.ServerName]
 	if !ok {
 		log.Printf("%s %s: refusing to serve request for %q", req.Method, req.URL, req.TLS.ServerName)
@@ -350,16 +398,6 @@ func parseTargets(targSpecs string) ([]*Target, error) {
 }
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "ca" {
-		log.Printf("making CA\n")
-		if err := makeCA(); err != nil {
-			log.Printf("makeCA: %v\n", err)
-		} else {
-			log.Printf("write CA files\n")
-		}
-		return
-	}
-
 	if len(os.Args) > 1 {
 		log.Printf("bad usage")
 		os.Exit(1)
@@ -374,13 +412,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := loadCA(); err != nil {
+	ca, err := loadOrMakeCA()
+	if err != nil {
 		log.Printf("loadCA: %v\n", err)
 		return
 	}
 
 	log.Printf("running server\n")
-	serv, err := newServer(proxy, targets...)
+	serv, err := newServer(ca, proxy, targets...)
 	if err != nil {
 		log.Printf("newServer: %v\n", err)
 		return
@@ -390,7 +429,7 @@ func main() {
 		Addr:    fmt.Sprintf("[::1]:%s", port),
 		Handler: serv,
 		TLSConfig: &tls.Config{
-			GetCertificate: serv.getCertificate,
+			GetCertificate: serv.getCertificateBySNI,
 		},
 	}
 

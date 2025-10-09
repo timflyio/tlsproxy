@@ -346,6 +346,7 @@ func (p *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	copyHeaders(preq.Header, req.Header)
+	preq.Header.Set("fly-src-optin", "*")
 	presp, err := target.cl.Do(preq)
 	if err != nil {
 		// TODO: better error translation, StatusBadGateway/StatusServiceUnavailable/StatusGatewayTimeout
@@ -377,7 +378,7 @@ func parseTargets(targSpecs string) ([]*Target, error) {
 	for _, targSpec := range strings.Split(targSpecs, ",") {
 		ws := strings.SplitN(targSpec, "=", 2)
 		if len(ws) != 2 {
-			return nil, fmt.Errorf("%q is malformed, must be HostName=EnvName")
+			return nil, fmt.Errorf("%q is malformed, must be HostName=EnvName", targSpec)
 		}
 
 		hostName := ws[0]

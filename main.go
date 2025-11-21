@@ -107,7 +107,7 @@ func writeKeyPem(cert *tls.Certificate, fn string) error {
 	return nil
 }
 
-func newTlsCert(host string, CA *tls.Certificate) (*tls.Certificate, error) {
+func newTlsCert(host string, CA *tls.Certificate, targetDomains []string) (*tls.Certificate, error) {
 	isCA := (CA == nil)
 
 	//_, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -128,6 +128,8 @@ func newTlsCert(host string, CA *tls.Certificate) (*tls.Certificate, error) {
 		keyUsage |= x509.KeyUsageCertSign
 		names = nil
 		notAfter = now.Add(CALife)
+	} else {
+		targetDomains = nil
 	}
 
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
@@ -155,6 +157,8 @@ func newTlsCert(host string, CA *tls.Certificate) (*tls.Certificate, error) {
 
 		DNSNames: names,
 		IsCA:     isCA,
+
+		PermittedURIDomains: targetDomains,
 	}
 
 	ca := cert
@@ -185,8 +189,8 @@ func newTlsCert(host string, CA *tls.Certificate) (*tls.Certificate, error) {
 	return tlsCert, nil
 }
 
-func makeCA() (*tls.Certificate, error) {
-	cert, err := newTlsCert(CertOrgName+" CA", nil)
+func makeCA(targetDomains []string) (*tls.Certificate, error) {
+	cert, err := newTlsCert(CertOrgName+" CA", nil, targetDomains)
 	if err != nil {
 		return nil, err
 	}
@@ -205,12 +209,23 @@ func loadCA() (*tls.Certificate, error) {
 	return &ca, nil
 }
 
-func loadOrMakeCA() (*tls.Certificate, error) {
+func loadOrMakeCA(targets ...*Target) (*tls.Certificate, error) {
+	var targetDomains []string
+	for _, target := range targets {
+		targetDomains = append(targetDomains, target.Host)
+	}
+
 	ca, err := loadCA()
 	if errors.Is(err, os.ErrNotExist) {
 		log.Printf("generating a CA...")
-		ca, err = makeCA()
+		ca, err = makeCA(targetDomains)
 	}
+	if err != nil {
+		return nil, err
+	}
+
+	// TODO: regen CA if target domains change
+
 	return ca, err
 }
 
@@ -281,7 +296,7 @@ func (p *Server) getCertificateBySNI(sni *tls.ClientHelloInfo) (*tls.Certificate
 	}
 
 	log.Printf("generate cert for %s\n", sni.ServerName)
-	cert, err := newTlsCert(sni.ServerName, p.ca)
+	cert, err := newTlsCert(sni.ServerName, p.ca, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -413,9 +428,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	ca, err := loadOrMakeCA()
+	ca, err := loadOrMakeCA(targets...)
 	if err != nil {
-		log.Printf("loadCA: %v\n", err)
+		log.Printf("loadOrMakeCA: %v\n", err)
 		return
 	}
 
